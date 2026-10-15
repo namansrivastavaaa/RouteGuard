@@ -124,6 +124,127 @@ app.get("/check", (req, res) => {
  res.json({ inRedZone: inRedZone(parseFloat(lat), parseFloat(lon)) });
 });
 
+// ---------------- Red Zone Avoidance Helpers ----------------
+
+/**
+ * Given a route's coordinates, find which red zones it crosses
+ * and generate ARC waypoints well outside each zone boundary
+ * so OSRM is forced to route completely around the zone.
+ */
+function computeArcWaypoints(routeCoords) {
+  const allDetours = []; // { zoneIdx, waypoints: [{lon, lat}] }
+
+  for (let zi = 0; zi < redZones.length; zi++) {
+    const zone = redZones[zi];
+
+    // Find first and last coordinate inside this zone
+    let entryIdx = -1;
+    let exitIdx = -1;
+
+    for (let i = 0; i < routeCoords.length; i++) {
+      const [lon, lat] = routeCoords[i];
+      const d = distance(lat, lon, zone.lat, zone.lon);
+      if (d < zone.radius) {
+        if (entryIdx === -1) entryIdx = i;
+        exitIdx = i;
+      }
+    }
+
+    if (entryIdx === -1) continue; // Route doesn't cross this zone
+
+    // Get points just outside entry and exit
+    const beforeIdx = Math.max(0, entryIdx - 1);
+    const afterIdx = Math.min(routeCoords.length - 1, exitIdx + 1);
+
+    const [lonEntry, latEntry] = routeCoords[beforeIdx];
+    const [lonExit, latExit] = routeCoords[afterIdx];
+
+    // Compute angles from zone center to entry and exit points
+    const entryAngle = Math.atan2(latEntry - zone.lat, lonEntry - zone.lon);
+    const exitAngle = Math.atan2(latExit - zone.lat, lonExit - zone.lon);
+
+    // We'll generate arc waypoints going around the zone.
+    // Choose the arc direction (clockwise vs counterclockwise) that
+    // goes the "long way" around — away from the zone center.
+    // We pick the arc that does NOT cross through the zone interior.
+
+    // Compute the midpoint of the route inside the zone to determine
+    // which side the route passes through
+    const midInsideIdx = Math.floor((entryIdx + exitIdx) / 2);
+    const [lonMid, latMid] = routeCoords[midInsideIdx];
+    const midAngle = Math.atan2(latMid - zone.lat, lonMid - zone.lon);
+
+    // Normalize angle difference
+    function normalizeAngle(a) {
+      while (a < -Math.PI) a += 2 * Math.PI;
+      while (a > Math.PI) a -= 2 * Math.PI;
+      return a;
+    }
+
+    // Determine arc sweep from entry to exit
+    let sweepCW = normalizeAngle(exitAngle - entryAngle); // clockwise
+    if (sweepCW < 0) sweepCW += 2 * Math.PI;
+
+    let sweepCCW = 2 * Math.PI - sweepCW; // counterclockwise
+
+    // Check which arc the midpoint falls on
+    const midDiff = normalizeAngle(midAngle - entryAngle);
+    const midDiffPositive = midDiff < 0 ? midDiff + 2 * Math.PI : midDiff;
+
+    // If the midpoint is on the CW arc (0 to sweepCW), we want the CCW arc (the other way)
+    const goClockwise = midDiffPositive > sweepCW;
+    const arcSweep = goClockwise ? sweepCW : sweepCCW;
+    const direction = goClockwise ? 1 : -1;
+
+    // Generate arc waypoints at radius * 1.8 (well outside the zone)
+    // Use enough points to create a proper corridor
+    const arcRadius = zone.radius * 1.8;
+    const numWaypoints = Math.max(4, Math.ceil(Math.abs(arcSweep) / (Math.PI / 6))); // ~every 30°
+
+    const degPerMeterLat = 1 / 111000;
+    const degPerMeterLon = 1 / (111320 * Math.cos(toRad(zone.lat)));
+
+    const arcPoints = [];
+
+    for (let i = 0; i <= numWaypoints; i++) {
+      const t = i / numWaypoints;
+      const angle = entryAngle + direction * arcSweep * t;
+
+      const wpLon = zone.lon + arcRadius * Math.cos(angle) * degPerMeterLon;
+      const wpLat = zone.lat + arcRadius * Math.sin(angle) * degPerMeterLat;
+
+      // Verify this point is actually outside ALL red zones
+      let outsideAll = true;
+      for (const z of redZones) {
+        if (distance(wpLat, wpLon, z.lat, z.lon) < z.radius * 1.2) {
+          outsideAll = false;
+          break;
+        }
+      }
+      if (outsideAll) {
+        arcPoints.push({ lon: wpLon, lat: wpLat });
+      }
+    }
+
+    if (arcPoints.length > 0) {
+      allDetours.push({
+        zoneIdx: zi,
+        entryCoord: { lon: lonEntry, lat: latEntry },
+        exitCoord: { lon: lonExit, lat: latExit },
+        waypoints: arcPoints,
+      });
+    }
+  }
+
+  return allDetours;
+}
+
+async function fetchOSRMRoute(coordString) {
+  const url = `https://router.project-osrm.org/route/v1/driving/${coordString}?overview=full&geometries=geojson`;
+  const response = await fetch(url);
+  return response.json();
+}
+
 // Core: Get route between coordinates, detect safety
 app.get("/route", async (req, res) => {
  const { coords, avoidRedZones } = req.query;
@@ -137,22 +258,104 @@ app.get("/route", async (req, res) => {
      rawPoints.map(([lon, lat]) => snapToRoad(lon, lat))
    );
 
-   const snappedCoordString = snappedPoints.map(([lon, lat]) => `${lon},${lat}`).join(";");
+   const coordString = snappedPoints.map(([lon, lat]) => `${lon},${lat}`).join(";");
 
-   let url = `https://router.project-osrm.org/route/v1/driving/${snappedCoordString}?overview=full&geometries=geojson`;
-
-   if (avoidRedZones === "true") {
-     console.warn("Avoid red zones requested — simulated only, not enforced by public OSRM");
-   }
-
-   const response = await fetch(url);
-   const data = await response.json();
+   // Fetch the initial route
+   let data = await fetchOSRMRoute(coordString);
 
    if (!data.routes || data.routes.length === 0)
      return res.status(404).json({ error: "No route found" });
 
-   const route = data.routes[0];
-   const unsafe = routeUnsafe(route);
+   let route = data.routes[0];
+   let unsafe = routeUnsafe(route);
+
+   // --- Active red zone avoidance via arc waypoints ---
+   if (avoidRedZones === "true" && unsafe) {
+     console.log("🛡️ Attempting to find a route that avoids red zones...");
+
+     const MAX_ATTEMPTS = 4;
+
+     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+       const detourSets = computeArcWaypoints(route.geometry.coordinates);
+
+       if (detourSets.length === 0) {
+         console.log("  No zone crossings detected, done.");
+         break;
+       }
+
+       // Build the new waypoint list: start → arc waypoints → end
+       const newPoints = [snappedPoints[0]]; // start [lon, lat]
+
+       for (const detour of detourSets) {
+         // Add the entry point (just before zone)
+         newPoints.push([detour.entryCoord.lon, detour.entryCoord.lat]);
+
+         // Add all arc waypoints (snapped to roads)
+         for (const wp of detour.waypoints) {
+           const snapped = await snapToRoad(wp.lon, wp.lat);
+           // Double-check snapped point is outside all red zones
+           const [sLon, sLat] = snapped;
+           let outsideAll = true;
+           for (const z of redZones) {
+             if (distance(sLat, sLon, z.lat, z.lon) < z.radius) {
+               outsideAll = false;
+               break;
+             }
+           }
+           if (outsideAll) {
+             newPoints.push(snapped);
+           } else {
+             console.warn(`    Skipping snapped point inside red zone: ${sLat},${sLon}`);
+           }
+         }
+
+         // Add the exit point (just after zone)
+         newPoints.push([detour.exitCoord.lon, detour.exitCoord.lat]);
+       }
+
+       newPoints.push(snappedPoints[snappedPoints.length - 1]); // end
+
+       // De-duplicate consecutive identical points
+       const dedupedPoints = [newPoints[0]];
+       for (let i = 1; i < newPoints.length; i++) {
+         const prev = dedupedPoints[dedupedPoints.length - 1];
+         if (Math.abs(newPoints[i][0] - prev[0]) > 0.00001 ||
+             Math.abs(newPoints[i][1] - prev[1]) > 0.00001) {
+           dedupedPoints.push(newPoints[i]);
+         }
+       }
+
+       const newCoordString = dedupedPoints.map(([lon, lat]) => `${lon},${lat}`).join(";");
+       console.log(`  Attempt ${attempt + 1}: trying route with ${dedupedPoints.length} waypoints`);
+
+       const newData = await fetchOSRMRoute(newCoordString);
+
+       if (!newData.routes || newData.routes.length === 0) {
+         console.warn(`  Attempt ${attempt + 1}: OSRM returned no route, keeping previous`);
+         break;
+       }
+
+       const newRoute = newData.routes[0];
+       const stillUnsafe = routeUnsafe(newRoute);
+
+       // Accept this new route
+       data = newData;
+       route = newRoute;
+       unsafe = stillUnsafe;
+
+       if (!stillUnsafe) {
+         console.log(`  ✅ Found safe route on attempt ${attempt + 1}!`);
+         break;
+       }
+
+       console.log(`  Attempt ${attempt + 1}: still crosses a red zone, retrying with tighter arc...`);
+       // On next iteration, computeArcWaypoints will re-analyze the new route
+     }
+
+     if (unsafe) {
+       console.warn("  ⚠️ Could not fully avoid all red zones after all attempts");
+     }
+   }
 
    res.json({
      route: data,

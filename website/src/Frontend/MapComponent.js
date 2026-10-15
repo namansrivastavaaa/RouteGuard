@@ -147,6 +147,12 @@ function MapComponent() {
           setPendingRoute(data);
           setShowUnsafePrompt(true);
         }
+        // Feedback when "Find Safer Route" was used
+        if (avoidRedZones && !data.unsafe) {
+          alert("✅ Found a safer route that avoids all red zones!");
+        } else if (avoidRedZones && data.unsafe) {
+          alert("⚠️ Could not find a route that completely avoids the red zone. Showing best alternative.");
+        }
       }
     } catch (err) {
       alert("Failed to fetch route from the server.");
