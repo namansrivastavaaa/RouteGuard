@@ -40,7 +40,9 @@ function MapComponent() {
   const [end, setEnd] = useState(null);
   const [waypoints, setWaypoints] = useState([]);
   const [route, setRoute] = useState(null);
+  const [originalRoute, setOriginalRoute] = useState(null); // ghost of unsafe route
   const [unsafeRoute, setUnsafeRoute] = useState(false);
+  const [isRerouted, setIsRerouted] = useState(false);
   const [selecting, setSelecting] = useState(null);
   const [addingWaypoint, setAddingWaypoint] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -50,6 +52,9 @@ function MapComponent() {
   const [logs, setLogs] = useState([]);
   const [navRunning, setNavRunning] = useState(false);
   const [showAlertsPanel, setShowAlertsPanel] = useState(false);
+  const [routeStatus, setRouteStatus] = useState(null); // inline status message
+  const [routeStats, setRouteStats] = useState(null); // distance/time info
+  const [rerouteInfo, setRerouteInfo] = useState(null); // detour cost info
 
   const logCooldown = useRef(false);
   const redZoneTimer = useRef(null);
@@ -110,7 +115,12 @@ function MapComponent() {
     if (!start || !end) return alert("Please select a start and end point first.");
     setIsLoading(true);
     setRoute(null);
+    setOriginalRoute(null);
     setUnsafeRoute(false);
+    setIsRerouted(false);
+    setRouteStatus(null);
+    setRouteStats(null);
+    setRerouteInfo(null);
 
     try {
       const wpParam = currentWaypoints.length
@@ -139,23 +149,40 @@ function MapComponent() {
       const data = await res.json();
 
       if (res.status !== 200 || !data.route || !data.route.routes.length) {
-        alert(data.error || "No route found.");
+        setRouteStatus({ type: "error", text: data.error || "No route found." });
       } else {
         setRoute(formatRoute(data.route));
         setUnsafeRoute(data.unsafe);
+
+        // Store route stats
+        if (data.stats) setRouteStats(data.stats);
+
         if (data.unsafe && !avoidRedZones) {
           setPendingRoute(data);
           setShowUnsafePrompt(true);
         }
-        // Feedback when "Find Safer Route" was used
-        if (avoidRedZones && !data.unsafe) {
-          alert("✅ Found a safer route that avoids all red zones!");
-        } else if (avoidRedZones && data.unsafe) {
-          alert("⚠️ Could not find a route that completely avoids the red zone. Showing best alternative.");
+
+        // Handle safer route results
+        if (avoidRedZones) {
+          if (!data.unsafe) {
+            setIsRerouted(true);
+            setRouteStatus({
+              type: "success",
+              text: "✅ Found a safer route that avoids all red zones!",
+            });
+          } else {
+            setRouteStatus({
+              type: "warning",
+              text: "⚠️ Best alternative found, but still clips a red zone.",
+            });
+          }
+          if (data.rerouteInfo) {
+            setRerouteInfo(data.rerouteInfo);
+          }
         }
       }
     } catch (err) {
-      alert("Failed to fetch route from the server.");
+      setRouteStatus({ type: "error", text: "Failed to fetch route from server." });
       console.error(err);
     } finally {
       setIsLoading(false);
@@ -168,12 +195,17 @@ function MapComponent() {
       setRoute(formatRoute(pendingRoute.route));
       setUnsafeRoute(true);
       setShowAlertsPanel(true); // ✅ show loitering alerts only after unsafe route
+      setRouteStatus({ type: "warning", text: "⚠️ Navigating through a red zone." });
     }
     setShowUnsafePrompt(false);
     setPendingRoute(null);
   };
 
   const handleFindSafeRoute = () => {
+    // Save the current unsafe route as a ghost for comparison
+    if (pendingRoute) {
+      setOriginalRoute(formatRoute(pendingRoute.route));
+    }
     setShowUnsafePrompt(false);
     setPendingRoute(null);
     fetchRoute(waypoints, true);
@@ -187,6 +219,8 @@ function MapComponent() {
 
   const handleGetRouteClick = () => {
     setWaypoints([]);
+    setOriginalRoute(null);
+    setIsRerouted(false);
     fetchRoute([], false);
   };
 
@@ -259,6 +293,12 @@ function MapComponent() {
     }
   }, [vehiclePos]);
 
+  // Determine route color
+  const getRouteColor = () => {
+    if (unsafeRoute) return "#ff6f00"; // orange warning for unsafe routes
+    return "#0D47A1"; // dark blue pathway
+  };
+
   return (
     <div style={{ display: "flex", height: "100vh", width: "100%" }}>
       {/* ------------ Map Section ------------ */}
@@ -275,11 +315,19 @@ function MapComponent() {
               zIndex: 1999,
               color: "white",
               display: "flex",
+              flexDirection: "column",
               alignItems: "center",
               justifyContent: "center",
             }}
           >
-            <h2>Calculating Route...</h2>
+            <div style={{
+              width: 40, height: 40, border: "4px solid rgba(255,255,255,0.3)",
+              borderTop: "4px solid white", borderRadius: "50%",
+              animation: "spin 0.8s linear infinite", marginBottom: 16,
+            }} />
+            <h2 style={{ margin: 0 }}>Calculating Safe Route...</h2>
+            <p style={{ opacity: 0.7, marginTop: 8 }}>Analyzing red zones and finding detours</p>
+            <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
           </div>
         )}
 
@@ -301,61 +349,80 @@ function MapComponent() {
           >
             <div
               style={{
-                background: "#333",
-                padding: "20px 40px",
-                borderRadius: "8px",
+                background: "linear-gradient(135deg, #2d2d2d, #3a3a3a)",
+                padding: "28px 44px",
+                borderRadius: "12px",
                 textAlign: "center",
                 border: "1px solid #555",
+                boxShadow: "0 20px 60px rgba(0,0,0,0.5)",
+                maxWidth: 400,
               }}
             >
-              <h3>⚠️ Unsafe Route Detected</h3>
-              <p>The fastest route passes through a designated red zone.</p>
+              <div style={{ fontSize: 40, marginBottom: 8 }}>⚠️</div>
+              <h3 style={{ margin: "0 0 8px", fontSize: 20 }}>Unsafe Route Detected</h3>
+              <p style={{ opacity: 0.8, fontSize: 14, marginBottom: 20 }}>
+                The fastest route passes through a designated red zone.
+                Choose an action below:
+              </p>
               <div
                 style={{
-                  marginTop: "20px",
                   display: "flex",
                   flexDirection: "column",
                   gap: "10px",
                 }}
               >
                 <button
-                  onClick={handleAcceptUnsafe}
-                  style={{
-                    padding: "12px",
-                    background: "#c82333",
-                    color: "white",
-                    border: "none",
-                    cursor: "pointer",
-                    fontSize: "16px",
-                  }}
-                >
-                  Accept Unsafe Route
-                </button>
-                <button
                   onClick={handleFindSafeRoute}
                   style={{
                     padding: "12px",
-                    background: "#218838",
+                    background: "linear-gradient(135deg, #218838, #28a745)",
                     color: "white",
                     border: "none",
                     cursor: "pointer",
                     fontSize: "16px",
+                    borderRadius: 6,
+                    fontWeight: 600,
+                    transition: "transform 0.1s",
                   }}
+                  onMouseOver={e => e.target.style.transform = "scale(1.02)"}
+                  onMouseOut={e => e.target.style.transform = "scale(1)"}
                 >
-                  Find Safer Route
+                  🛡️ Find Safer Route
                 </button>
                 <button
                   onClick={handleAddWaypointChoice}
                   style={{
                     padding: "12px",
-                    background: "#0069d9",
+                    background: "linear-gradient(135deg, #0056b3, #0069d9)",
                     color: "white",
                     border: "none",
                     cursor: "pointer",
                     fontSize: "16px",
+                    borderRadius: 6,
+                    fontWeight: 600,
+                    transition: "transform 0.1s",
                   }}
+                  onMouseOver={e => e.target.style.transform = "scale(1.02)"}
+                  onMouseOut={e => e.target.style.transform = "scale(1)"}
                 >
-                  Add Waypoint to Avoid
+                  📍 Add Waypoint to Avoid
+                </button>
+                <button
+                  onClick={handleAcceptUnsafe}
+                  style={{
+                    padding: "12px",
+                    background: "transparent",
+                    color: "#ff6b6b",
+                    border: "1px solid #ff6b6b",
+                    cursor: "pointer",
+                    fontSize: "14px",
+                    borderRadius: 6,
+                    transition: "transform 0.1s",
+                  }}
+                  onMouseOver={e => e.target.style.transform = "scale(1.02)"}
+                  onMouseOut={e => e.target.style.transform = "scale(1)"}
+                >
+                  Accept Unsafe Route
                 </button>
               </div>
             </div>
@@ -369,11 +436,25 @@ function MapComponent() {
         >
           <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
           {getRedZonePolygons()}
+
+          {/* Ghost of original unsafe route (faded) */}
+          {originalRoute && isRerouted && (
+            <Polyline
+              positions={originalRoute}
+              color="red"
+              weight={3}
+              opacity={0.3}
+              dashArray="8 6"
+            />
+          )}
+
+          {/* Active route */}
           {route && (
             <Polyline
               positions={route}
-              color={unsafeRoute ? "orange" : "blue"}
+              color={getRouteColor()}
               weight={5}
+              opacity={0.9}
             />
           )}
           {start && <Marker position={start.split(",").map(Number)} icon={destIcon} />}
@@ -415,48 +496,122 @@ function MapComponent() {
         <button onClick={() => setSelecting("end")}>Set End</button>
 
         <button
-  onClick={handleGetRouteClick}
-  style={{
-    width: "100%",
-    padding: 8,
-    marginTop: 10,
-    background: "#007bff",
-    color: "white",
-    border: "none",
-  }}
-  disabled={isLoading || !start || !end}
->
-  {isLoading ? "Calculating..." : "Get Route"}
-</button>
+          onClick={handleGetRouteClick}
+          style={{
+            width: "100%",
+            padding: 8,
+            marginTop: 10,
+            background: "#007bff",
+            color: "white",
+            border: "none",
+            borderRadius: 4,
+            cursor: "pointer",
+          }}
+          disabled={isLoading || !start || !end}
+        >
+          {isLoading ? "Calculating..." : "Get Route"}
+        </button>
 
-<button
-  onClick={() => setNavRunning(true)}
-  style={{
-    width: "100%",
-    padding: 8,
-    marginTop: 5,
-    background: "#28a745",
-    color: "white",
-    border: "none",
-  }}
-  disabled={!route}
->
-  Start Navigation
-</button>
+        <button
+          onClick={() => setNavRunning(true)}
+          style={{
+            width: "100%",
+            padding: 8,
+            marginTop: 5,
+            background: "#28a745",
+            color: "white",
+            border: "none",
+            borderRadius: 4,
+            cursor: "pointer",
+          }}
+          disabled={!route}
+        >
+          Start Navigation
+        </button>
 
-<button
-  onClick={handleStopNavigation}
-  style={{
-    width: "100%",
-    padding: 8,
-    marginTop: 5,
-    background: "#dc3545",
-    color: "white",
-    border: "none",
-  }}
->
-  Stop Navigation
-</button>
+        <button
+          onClick={handleStopNavigation}
+          style={{
+            width: "100%",
+            padding: 8,
+            marginTop: 5,
+            background: "#dc3545",
+            color: "white",
+            border: "none",
+            borderRadius: 4,
+            cursor: "pointer",
+          }}
+        >
+          Stop Navigation
+        </button>
+
+        {/* ------------ Route Status Banner ------------ */}
+        {routeStatus && (
+          <div style={{
+            marginTop: 12,
+            padding: "10px 14px",
+            borderRadius: 8,
+            fontSize: 13,
+            fontWeight: 600,
+            background: routeStatus.type === "success" ? "#d4edda"
+              : routeStatus.type === "warning" ? "#fff3cd"
+              : "#f8d7da",
+            color: routeStatus.type === "success" ? "#155724"
+              : routeStatus.type === "warning" ? "#856404"
+              : "#721c24",
+            border: `1px solid ${
+              routeStatus.type === "success" ? "#c3e6cb"
+              : routeStatus.type === "warning" ? "#ffeaa7"
+              : "#f5c6cb"
+            }`,
+          }}>
+            {routeStatus.text}
+          </div>
+        )}
+
+        {/* ------------ Route Stats ------------ */}
+        {routeStats && (
+          <div style={{
+            marginTop: 10,
+            padding: "10px 14px",
+            background: "#fff",
+            borderRadius: 8,
+            border: "1px solid #e0e0e0",
+            fontSize: 13,
+          }}>
+            <div style={{ fontWeight: 600, marginBottom: 6 }}>📊 Route Info</div>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span>Distance:</span>
+              <span style={{ fontWeight: 600 }}>{routeStats.current.distanceKm} km</span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span>Duration:</span>
+              <span style={{ fontWeight: 600 }}>{routeStats.current.durationMin} min</span>
+            </div>
+          </div>
+        )}
+
+        {/* ------------ Reroute Comparison ------------ */}
+        {rerouteInfo && (
+          <div style={{
+            marginTop: 8,
+            padding: "10px 14px",
+            background: isRerouted && !unsafeRoute ? "#e8f5e9" : "#fff8e1",
+            borderRadius: 8,
+            border: `1px solid ${isRerouted && !unsafeRoute ? "#c8e6c9" : "#ffe082"}`,
+            fontSize: 12,
+          }}>
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>
+              {isRerouted && !unsafeRoute ? "🛡️ Detour Cost" : "🔄 Reroute Info"}
+            </div>
+            <div>{rerouteInfo.message}</div>
+            {isRerouted && originalRoute && (
+              <div style={{ marginTop: 4, opacity: 0.7, fontStyle: "italic" }}>
+                Original route shown as faded red line
+              </div>
+            )}
+          </div>
+        )}
 
         <div
           style={{

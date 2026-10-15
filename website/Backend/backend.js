@@ -52,18 +52,56 @@ const toRad = deg => deg * Math.PI / 180;
 // ---------------- Distance + Red Zone Checks ----------------
 
 function distance(lat1, lon1, lat2, lon2) {
- const φ1 = toRad(lat1), φ2 = toRad(lat2);
- const Δλ = toRad(lon2 - lon1);
- return Math.acos(Math.sin(φ1) * Math.sin(φ2) +
-   Math.cos(φ1) * Math.cos(φ2) * Math.cos(Δλ)) * R;
+ const p1 = toRad(lat1), p2 = toRad(lat2);
+ const dL = toRad(lon2 - lon1);
+ return Math.acos(
+   Math.min(1, Math.max(-1, Math.sin(p1) * Math.sin(p2) +
+   Math.cos(p1) * Math.cos(p2) * Math.cos(dL)))
+ ) * R;
 }
 
 function inRedZone(lat, lon) {
  return redZones.some(zone => distance(lat, lon, zone.lat, zone.lon) < zone.radius);
 }
 
+// Safety buffer multiplier — catches routes that barely clip the zone edge
+const SAFETY_BUFFER = 1.08;
+
+function inRedZoneWithBuffer(lat, lon) {
+  return redZones.some(zone => distance(lat, lon, zone.lat, zone.lon) < zone.radius * SAFETY_BUFFER);
+}
+
 function routeUnsafe(route) {
  return route.geometry.coordinates.some(([lon, lat]) => inRedZone(lat, lon));
+}
+
+function routeUnsafeWithBuffer(route) {
+  return route.geometry.coordinates.some(([lon, lat]) => inRedZoneWithBuffer(lat, lon));
+}
+
+// Thorough safety check: checks all route points + interpolated points along segments
+function routeUnsafeDetailed(route) {
+  const coords = route.geometry.coordinates;
+  for (let i = 0; i < coords.length; i++) {
+    const [lon, lat] = coords[i];
+    if (inRedZoneWithBuffer(lat, lon)) return true;
+
+    // Check intermediate points on segments
+    if (i < coords.length - 1) {
+      const [lon2, lat2] = coords[i + 1];
+      const segDist = distance(lat, lon, lat2, lon2);
+      if (segDist > 40) {
+        const steps = Math.min(10, Math.ceil(segDist / 40));
+        for (let s = 1; s < steps; s++) {
+          const t = s / steps;
+          const iLat = lat + t * (lat2 - lat);
+          const iLon = lon + t * (lon2 - lon);
+          if (inRedZoneWithBuffer(iLat, iLon)) return true;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 // ---------------- Helper: Snap Point to Nearest Road ----------------
@@ -127,122 +165,72 @@ app.get("/check", (req, res) => {
 // ---------------- Red Zone Avoidance Helpers ----------------
 
 /**
- * Given a route's coordinates, find which red zones it crosses
- * and generate ARC waypoints well outside each zone boundary
- * so OSRM is forced to route completely around the zone.
+ * Generate candidate bypass waypoints around a red zone given start and end points.
+ * Evaluates both left and right sides of the zone at multiple offset distances,
+ * using both single perpendicular waypoints and 2-waypoint tangent corridors.
  */
-function computeArcWaypoints(routeCoords) {
-  const allDetours = []; // { zoneIdx, waypoints: [{lon, lat}] }
+function generateBypassCandidates(start, end, zone) {
+  const [sLon, sLat] = start;
+  const [eLon, eLat] = end;
 
-  for (let zi = 0; zi < redZones.length; zi++) {
-    const zone = redZones[zi];
+  const cosLat = Math.cos(toRad(zone.lat));
+  const dx = (eLon - sLon) * 111320 * cosLat;
+  const dy = (eLat - sLat) * 111000;
+  const len = Math.hypot(dx, dy) || 1;
 
-    // Find first and last coordinate inside this zone
-    let entryIdx = -1;
-    let exitIdx = -1;
+  // Unit vector along the travel direction
+  const ux = dx / len;
+  const uy = dy / len;
 
-    for (let i = 0; i < routeCoords.length; i++) {
-      const [lon, lat] = routeCoords[i];
-      const d = distance(lat, lon, zone.lat, zone.lon);
-      if (d < zone.radius) {
-        if (entryIdx === -1) entryIdx = i;
-        exitIdx = i;
-      }
-    }
+  // Conversion factors
+  const degPerMLat = 1 / 111000;
+  const degPerMLon = 1 / (111320 * cosLat);
 
-    if (entryIdx === -1) continue; // Route doesn't cross this zone
+  const candidates = [];
+  const multipliers = [1.3, 1.6, 2.0, 2.5, 3.0];
 
-    // Get points just outside entry and exit
-    const beforeIdx = Math.max(0, entryIdx - 1);
-    const afterIdx = Math.min(routeCoords.length - 1, exitIdx + 1);
+  for (const mult of multipliers) {
+    const dist = zone.radius * mult;
 
-    const [lonEntry, latEntry] = routeCoords[beforeIdx];
-    const [lonExit, latExit] = routeCoords[afterIdx];
+    // Perpendicular waypoints (left and right of travel vector)
+    const leftLon = zone.lon + (-uy * dist) * degPerMLon;
+    const leftLat = zone.lat + (ux * dist) * degPerMLat;
+    const rightLon = zone.lon + (uy * dist) * degPerMLon;
+    const rightLat = zone.lat + (-ux * dist) * degPerMLat;
 
-    // Compute angles from zone center to entry and exit points
-    const entryAngle = Math.atan2(latEntry - zone.lat, lonEntry - zone.lon);
-    const exitAngle = Math.atan2(latExit - zone.lat, lonExit - zone.lon);
+    // 2-waypoint tangent corridor points (leading in and leading out around the zone)
+    const alongOffset = dist * 0.7;
+    const l1 = [leftLon - (ux * alongOffset) * degPerMLon, leftLat - (uy * alongOffset) * degPerMLat];
+    const l2 = [leftLon + (ux * alongOffset) * degPerMLon, leftLat + (uy * alongOffset) * degPerMLat];
+    const r1 = [rightLon - (ux * alongOffset) * degPerMLon, rightLat - (uy * alongOffset) * degPerMLat];
+    const r2 = [rightLon + (ux * alongOffset) * degPerMLon, rightLat + (uy * alongOffset) * degPerMLat];
 
-    // We'll generate arc waypoints going around the zone.
-    // Choose the arc direction (clockwise vs counterclockwise) that
-    // goes the "long way" around — away from the zone center.
-    // We pick the arc that does NOT cross through the zone interior.
+    // Single perpendicular waypoint candidates
+    candidates.push({ name: `Left 1-wp x${mult}`, wps: [[leftLon, leftLat]] });
+    candidates.push({ name: `Right 1-wp x${mult}`, wps: [[rightLon, rightLat]] });
 
-    // Compute the midpoint of the route inside the zone to determine
-    // which side the route passes through
-    const midInsideIdx = Math.floor((entryIdx + exitIdx) / 2);
-    const [lonMid, latMid] = routeCoords[midInsideIdx];
-    const midAngle = Math.atan2(latMid - zone.lat, lonMid - zone.lon);
-
-    // Normalize angle difference
-    function normalizeAngle(a) {
-      while (a < -Math.PI) a += 2 * Math.PI;
-      while (a > Math.PI) a -= 2 * Math.PI;
-      return a;
-    }
-
-    // Determine arc sweep from entry to exit
-    let sweepCW = normalizeAngle(exitAngle - entryAngle); // clockwise
-    if (sweepCW < 0) sweepCW += 2 * Math.PI;
-
-    let sweepCCW = 2 * Math.PI - sweepCW; // counterclockwise
-
-    // Check which arc the midpoint falls on
-    const midDiff = normalizeAngle(midAngle - entryAngle);
-    const midDiffPositive = midDiff < 0 ? midDiff + 2 * Math.PI : midDiff;
-
-    // If the midpoint is on the CW arc (0 to sweepCW), we want the CCW arc (the other way)
-    const goClockwise = midDiffPositive > sweepCW;
-    const arcSweep = goClockwise ? sweepCW : sweepCCW;
-    const direction = goClockwise ? 1 : -1;
-
-    // Generate arc waypoints at radius * 1.8 (well outside the zone)
-    // Use enough points to create a proper corridor
-    const arcRadius = zone.radius * 1.8;
-    const numWaypoints = Math.max(4, Math.ceil(Math.abs(arcSweep) / (Math.PI / 6))); // ~every 30°
-
-    const degPerMeterLat = 1 / 111000;
-    const degPerMeterLon = 1 / (111320 * Math.cos(toRad(zone.lat)));
-
-    const arcPoints = [];
-
-    for (let i = 0; i <= numWaypoints; i++) {
-      const t = i / numWaypoints;
-      const angle = entryAngle + direction * arcSweep * t;
-
-      const wpLon = zone.lon + arcRadius * Math.cos(angle) * degPerMeterLon;
-      const wpLat = zone.lat + arcRadius * Math.sin(angle) * degPerMeterLat;
-
-      // Verify this point is actually outside ALL red zones
-      let outsideAll = true;
-      for (const z of redZones) {
-        if (distance(wpLat, wpLon, z.lat, z.lon) < z.radius * 1.2) {
-          outsideAll = false;
-          break;
-        }
-      }
-      if (outsideAll) {
-        arcPoints.push({ lon: wpLon, lat: wpLat });
-      }
-    }
-
-    if (arcPoints.length > 0) {
-      allDetours.push({
-        zoneIdx: zi,
-        entryCoord: { lon: lonEntry, lat: latEntry },
-        exitCoord: { lon: lonExit, lat: latExit },
-        waypoints: arcPoints,
-      });
-    }
+    // 2-waypoint corridor candidates (forces smooth road bypass)
+    candidates.push({ name: `Left corridor x${mult}`, wps: [l1, l2] });
+    candidates.push({ name: `Right corridor x${mult}`, wps: [r1, r2] });
   }
 
-  return allDetours;
+  return candidates;
 }
 
 async function fetchOSRMRoute(coordString) {
   const url = `https://router.project-osrm.org/route/v1/driving/${coordString}?overview=full&geometries=geojson`;
   const response = await fetch(url);
   return response.json();
+}
+
+// Helper: extract route stats
+function getRouteStats(route) {
+  return {
+    distance: route.distance,
+    duration: route.duration,
+    distanceKm: (route.distance / 1000).toFixed(1),
+    durationMin: (route.duration / 60).toFixed(1),
+  };
 }
 
 // Core: Get route between coordinates, detect safety
@@ -267,103 +255,144 @@ app.get("/route", async (req, res) => {
      return res.status(404).json({ error: "No route found" });
 
    let route = data.routes[0];
-   let unsafe = routeUnsafe(route);
+   let unsafe = routeUnsafeDetailed(route);
 
-   // --- Active red zone avoidance via arc waypoints ---
+   // Save original route stats for comparison
+   const originalStats = getRouteStats(route);
+
+   // --- Active red zone avoidance: evaluate candidate bypasses in parallel ---
    if (avoidRedZones === "true" && unsafe) {
-     console.log("🛡️ Attempting to find a route that avoids red zones...");
+     console.log("🛡️ Finding optimal bypass route to avoid red zones...");
 
-     const MAX_ATTEMPTS = 4;
+     // Identify all red zones that this route penetrates
+     const penetratedZones = redZones.filter(zone =>
+       route.geometry.coordinates.some(([lon, lat]) =>
+         distance(lat, lon, zone.lat, zone.lon) < zone.radius * SAFETY_BUFFER
+       )
+     );
 
-     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-       const detourSets = computeArcWaypoints(route.geometry.coordinates);
+     console.log(`  Route penetrates ${penetratedZones.length} red zone(s)`);
 
-       if (detourSets.length === 0) {
-         console.log("  No zone crossings detected, done.");
-         break;
-       }
+     const startPt = snappedPoints[0];
+     const endPt = snappedPoints[snappedPoints.length - 1];
 
-       // Build the new waypoint list: start → arc waypoints → end
-       const newPoints = [snappedPoints[0]]; // start [lon, lat]
+     let bestSafeCandidate = null;
+     let bestCandidateData = null;
 
-       for (const detour of detourSets) {
-         // Add the entry point (just before zone)
-         newPoints.push([detour.entryCoord.lon, detour.entryCoord.lat]);
+     for (const zone of penetratedZones) {
+       const candidates = generateBypassCandidates(startPt, endPt, zone);
 
-         // Add all arc waypoints (snapped to roads)
-         for (const wp of detour.waypoints) {
-           const snapped = await snapToRoad(wp.lon, wp.lat);
-           // Double-check snapped point is outside all red zones
-           const [sLon, sLat] = snapped;
-           let outsideAll = true;
-           for (const z of redZones) {
-             if (distance(sLat, sLon, z.lat, z.lon) < z.radius) {
-               outsideAll = false;
-               break;
-             }
-           }
-           if (outsideAll) {
-             newPoints.push(snapped);
+       // Query all candidate routes concurrently
+       const promises = candidates.map(async (c) => {
+         try {
+           let fullPoints;
+           if (snappedPoints.length <= 2) {
+             fullPoints = [startPt, ...c.wps, endPt];
            } else {
-             console.warn(`    Skipping snapped point inside red zone: ${sLat},${sLon}`);
+             // If user added intermediate waypoints, find segment closest to zone
+             let bestSegIdx = 0;
+             let minSegDist = Infinity;
+             for (let i = 0; i < snappedPoints.length - 1; i++) {
+               const midLat = (snappedPoints[i][1] + snappedPoints[i + 1][1]) / 2;
+               const midLon = (snappedPoints[i][0] + snappedPoints[i + 1][0]) / 2;
+               const d = distance(midLat, midLon, zone.lat, zone.lon);
+               if (d < minSegDist) {
+                 minSegDist = d;
+                 bestSegIdx = i;
+               }
+             }
+             fullPoints = [
+               ...snappedPoints.slice(0, bestSegIdx + 1),
+               ...c.wps,
+               ...snappedPoints.slice(bestSegIdx + 1),
+             ];
            }
+
+           const cCoordStr = fullPoints
+             .map(([lon, lat]) => `${lon.toFixed(6)},${lat.toFixed(6)}`)
+             .join(";");
+
+           const resData = await fetchOSRMRoute(cCoordStr);
+           if (!resData.routes || resData.routes.length === 0) return null;
+
+           const candRoute = resData.routes[0];
+           const isUnsafe = routeUnsafeDetailed(candRoute);
+
+           return {
+             name: c.name,
+             data: resData,
+             route: candRoute,
+             unsafe: isUnsafe,
+             distance: candRoute.distance,
+             duration: candRoute.duration,
+           };
+         } catch (e) {
+           return null;
          }
+       });
 
-         // Add the exit point (just after zone)
-         newPoints.push([detour.exitCoord.lon, detour.exitCoord.lat]);
-       }
+       const evaluated = (await Promise.all(promises)).filter(Boolean);
+       const safeOnes = evaluated.filter(r => !r.unsafe);
 
-       newPoints.push(snappedPoints[snappedPoints.length - 1]); // end
+       console.log(`  Zone at [${zone.lat}, ${zone.lon}]: ${evaluated.length} candidates tested, ${safeOnes.length} safe`);
 
-       // De-duplicate consecutive identical points
-       const dedupedPoints = [newPoints[0]];
-       for (let i = 1; i < newPoints.length; i++) {
-         const prev = dedupedPoints[dedupedPoints.length - 1];
-         if (Math.abs(newPoints[i][0] - prev[0]) > 0.00001 ||
-             Math.abs(newPoints[i][1] - prev[1]) > 0.00001) {
-           dedupedPoints.push(newPoints[i]);
+       if (safeOnes.length > 0) {
+         // Sort by shortest distance — find the minimal detour
+         safeOnes.sort((a, b) => a.distance - b.distance);
+         if (!bestSafeCandidate || safeOnes[0].distance < bestSafeCandidate.distance) {
+           bestSafeCandidate = safeOnes[0];
          }
+       } else if (!bestSafeCandidate && evaluated.length > 0) {
+         // Fallback: pick candidate furthest from zone center
+         evaluated.sort((a, b) => {
+           const minA = Math.min(...a.route.geometry.coordinates.map(([lon, lat]) => distance(lat, lon, zone.lat, zone.lon)));
+           const minB = Math.min(...b.route.geometry.coordinates.map(([lon, lat]) => distance(lat, lon, zone.lat, zone.lon)));
+           return minB - minA; // furthest is best
+         });
+         bestCandidateData = evaluated[0];
        }
-
-       const newCoordString = dedupedPoints.map(([lon, lat]) => `${lon},${lat}`).join(";");
-       console.log(`  Attempt ${attempt + 1}: trying route with ${dedupedPoints.length} waypoints`);
-
-       const newData = await fetchOSRMRoute(newCoordString);
-
-       if (!newData.routes || newData.routes.length === 0) {
-         console.warn(`  Attempt ${attempt + 1}: OSRM returned no route, keeping previous`);
-         break;
-       }
-
-       const newRoute = newData.routes[0];
-       const stillUnsafe = routeUnsafe(newRoute);
-
-       // Accept this new route
-       data = newData;
-       route = newRoute;
-       unsafe = stillUnsafe;
-
-       if (!stillUnsafe) {
-         console.log(`  ✅ Found safe route on attempt ${attempt + 1}!`);
-         break;
-       }
-
-       console.log(`  Attempt ${attempt + 1}: still crosses a red zone, retrying with tighter arc...`);
-       // On next iteration, computeArcWaypoints will re-analyze the new route
      }
 
-     if (unsafe) {
-       console.warn("  ⚠️ Could not fully avoid all red zones after all attempts");
+     if (bestSafeCandidate) {
+       data = bestSafeCandidate.data;
+       route = bestSafeCandidate.route;
+       unsafe = false;
+       console.log(`  ✅ Optimal safe detour chosen (${bestSafeCandidate.name}): ${(route.distance / 1000).toFixed(2)} km, ${(route.duration / 60).toFixed(1)} min`);
+     } else if (bestCandidateData) {
+       data = bestCandidateData.data;
+       route = bestCandidateData.route;
+       unsafe = bestCandidateData.unsafe;
+       console.warn(`  ⚠️ Best available candidate: ${(route.distance / 1000).toFixed(2)} km (unsafe: ${unsafe})`);
      }
    }
 
-   res.json({
+   // Build response with route comparison stats
+   const currentStats = getRouteStats(route);
+   const responseData = {
      route: data,
      unsafe,
      message: unsafe
        ? "⚠️ This route passes through a red zone."
        : "✅ Safe route.",
-   });
+     stats: {
+       original: originalStats,
+       current: currentStats,
+     },
+   };
+
+   // Add reroute info if we successfully rerouted
+   if (avoidRedZones === "true") {
+     const extraDist = (currentStats.distance - originalStats.distance) / 1000;
+     const extraTime = (currentStats.duration - originalStats.duration) / 60;
+     responseData.rerouted = true;
+     responseData.rerouteInfo = {
+       extraDistanceKm: extraDist.toFixed(1),
+       extraTimeMin: extraTime.toFixed(1),
+       message: `Detour adds ${Math.abs(extraDist).toFixed(1)} km and ${Math.abs(extraTime).toFixed(1)} min`,
+     };
+   }
+
+   res.json(responseData);
 
  } catch (err) {
    console.error("Route fetch error:", err);
